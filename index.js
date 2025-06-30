@@ -2,6 +2,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const pool = require('./db'); // Your database connection pool
 
 const app = express();
@@ -10,6 +12,23 @@ const PORT = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+
+// =================================================================
+// IMPORTANT: DATABASE SCHEMA REQUIREMENTS FOR THESE CHANGES
+// =================================================================
+// 1. You MUST add a password column to your Users table:
+//    ALTER TABLE Users ADD COLUMN password_hash TEXT;
+//
+// 2. You MUST create a new table for password reset tokens:
+//    CREATE TABLE PasswordResetTokens (
+//      id SERIAL PRIMARY KEY,
+//      user_id TEXT NOT NULL REFERENCES Users(id) ON DELETE CASCADE,
+//      token_hash TEXT NOT NULL UNIQUE,
+//      expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+//    );
+// =================================================================
+
 
 // --- Helper: GEN_Z_SURVEY_QUESTION_IDS (for historical data logging) ---
 const GEN_Z_SURVEY_QUESTION_IDS = [
@@ -63,9 +82,9 @@ async function addApplicantSurveyToHistorical(client, survey, applicantSurveyId)
         submission_source: `ApplicantSurvey_Company_${survey.companyId}_Stage_${survey.stageNumber}`,
         submission_date: survey.submittedAt || new Date().toISOString(),
         full_name: survey.applicantName,
-        age: null, 
-        gender: null,
-        study_field: null,
+        age: survey.age || null, 
+        gender: survey.gender || null,
+        study_field: survey.studyField || null,
     };
 
     GEN_Z_SURVEY_QUESTION_IDS.forEach(qId => {
@@ -93,16 +112,15 @@ async function addApplicantSurveyToHistorical(client, survey, applicantSurveyId)
 
 // Test Route
 app.get('/', (req, res) => {
-  res.send('TalentInsight Hub Backend is running with new SQL schema!');
+  res.send('Data Driven Salahkar Backend is running!');
 });
 
 // === USER AUTHENTICATION & MANAGEMENT ===
 app.post('/api/auth/signup', async (req, res) => {
-  const { fullName, email, role } = req.body; 
-  // Password validation is done on frontend; backend only stores user info per schema
+  const { fullName, email, role, password } = req.body; 
 
-  if (!fullName || !email || !role) {
-    return res.status(400).json({ error: 'Full Name, Email, and Role are required.' });
+  if (!fullName || !email || !role || !password) {
+    return res.status(400).json({ error: 'Full Name, Email, Role, and Password are required.' });
   }
   if (!['CANDIDATE', 'COMPANY', 'ADMIN'].includes(role)) {
     return res.status(400).json({ error: 'Invalid role specified.' });
@@ -114,22 +132,26 @@ app.post('/api/auth/signup', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // Hash the password
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
     const userId = `user_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const newUserQuery = `
-      INSERT INTO Users (id, full_name, email, role)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO Users (id, full_name, email, role, password_hash)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING id, full_name, email, role;
     `;
-    const values = [userId, fullName, email, role];
+    const values = [userId, fullName, email, role, passwordHash];
     const result = await client.query(newUserQuery, values);
     const newUser = result.rows[0];
 
-    // If a new COMPANY user is created, initialize their CompanySettings
     if (newUser.role === 'COMPANY') {
       await client.query(
         `INSERT INTO CompanySettings (company_id, company_name, total_interviews)
          VALUES ($1, $2, $3) ON CONFLICT (company_id) DO NOTHING;`,
-        [newUser.id, newUser.full_name, 1] // Default total_interviews to 1
+        [newUser.id, newUser.full_name, 1]
       );
     }
     await client.query('COMMIT');
@@ -151,27 +173,148 @@ app.post('/api/auth/signup', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body; 
-  if (!email) { 
-    return res.status(400).json({ error: 'Email is required.' });
+  if (!email || !password) { 
+    return res.status(400).json({ error: 'Email and password are required.' });
   }
-  // Actual password check against a hashed password would go here if schema supported it.
-  // For now, just finds user by email.
+
   try {
-    const userQuery = 'SELECT id, full_name, email, role FROM Users WHERE email = $1';
+    const userQuery = 'SELECT id, full_name, email, role, password_hash FROM Users WHERE email = $1';
     const result = await pool.query(userQuery, [email]);
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid email or user not found.' });
+      return res.status(401).json({ error: 'Invalid email or password.' });
     }
     const user = result.rows[0];
+
+    if (!user.password_hash) {
+      // Handle users created before password system (e.g., social logins)
+      return res.status(401).json({ error: 'This account is likely registered via a social provider and does not have a password. Please use the social login option.' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    // Exclude password_hash from the returned user object
+    const { password_hash, ...userToSend } = user;
+
     res.status(200).json({
       message: 'Login successful!',
-      user: user
+      user: userToSend
     });
   } catch (error) {
     console.error('Error logging in user:', error);
     res.status(500).json({ error: 'Internal server error during login.' });
   }
 });
+
+// --- PASSWORD RESET ENDPOINTS ---
+app.post('/api/auth/request-password-reset', async (req, res) => {
+    const { email } = req.body;
+    if (!email) {
+        return res.status(400).json({ error: 'Email is required.' });
+    }
+    const client = await pool.connect();
+    try {
+        const userResult = await client.query('SELECT id FROM Users WHERE email = $1', [email]);
+        if (userResult.rows.length === 0) {
+            // Still send a success message to prevent email enumeration attacks
+            return res.status(200).json({ message: 'If an account with that email exists, a password reset link has been sent.' });
+        }
+        const userId = userResult.rows[0].id;
+        
+        // Invalidate old tokens for this user
+        await client.query('DELETE FROM PasswordResetTokens WHERE user_id = $1', [userId]);
+
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+        const expiresAt = new Date(Date.now() + 3600000); // 1 hour from now
+
+        await client.query(
+            'INSERT INTO PasswordResetTokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+            [userId, tokenHash, expiresAt]
+        );
+
+        // In a real app, send an email here.
+        console.log('--- PASSWORD RESET ---');
+        console.log(`User: ${email}`);
+        console.log(`Reset Token (send this in email link): ${resetToken}`);
+        console.log('--------------------');
+
+        res.status(200).json({ message: 'If an account with that email exists, a password reset link has been sent.' });
+
+    } catch (error) {
+        console.error('Error in request-password-reset:', error);
+        res.status(500).json({ error: 'Internal server error.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) {
+        return res.status(400).json({ error: 'Token and new password are required.' });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+        const tokenResult = await client.query(
+            'SELECT user_id, expires_at FROM PasswordResetTokens WHERE token_hash = $1',
+            [tokenHash]
+        );
+
+        if (tokenResult.rows.length === 0) {
+            return res.status(400).json({ error: 'Invalid or expired password reset token.' });
+        }
+        const { user_id, expires_at } = tokenResult.rows[0];
+        
+        if (new Date() > new Date(expires_at)) {
+             await client.query('DELETE FROM PasswordResetTokens WHERE token_hash = $1', [tokenHash]);
+             await client.query('COMMIT');
+             return res.status(400).json({ error: 'Password reset token has expired.' });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const newPasswordHash = await bcrypt.hash(newPassword, salt);
+        
+        await client.query(
+            'UPDATE Users SET password_hash = $1 WHERE id = $2',
+            [newPasswordHash, user_id]
+        );
+
+        await client.query('DELETE FROM PasswordResetTokens WHERE user_id = $1', [user_id]);
+        
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Password has been reset successfully.' });
+
+    } catch(error) {
+        await client.query('ROLLBACK');
+        console.error('Error in reset-password:', error);
+        res.status(500).json({ error: 'Internal server error.' });
+    } finally {
+        client.release();
+    }
+});
+
+// --- SOCIAL LOGIN PLACEHOLDERS ---
+// A real implementation would use a library like Passport.js
+app.get('/api/auth/google', (req, res) => {
+    res.status(501).json({ error: 'Google OAuth not implemented. This is a placeholder endpoint.'});
+});
+app.get('/api/auth/google/callback', (req, res) => {
+    res.status(501).json({ error: 'Google OAuth callback not implemented. This is a placeholder endpoint.'});
+});
+app.get('/api/auth/linkedin', (req, res) => {
+    res.status(501).json({ error: 'LinkedIn OAuth not implemented. This is a placeholder endpoint.'});
+});
+app.get('/api/auth/linkedin/callback', (req, res) => {
+    res.status(501).json({ error: 'LinkedIn OAuth callback not implemented. This is a placeholder endpoint.'});
+});
+
 
 app.get('/api/admin/users', async (req, res) => {
     try {
@@ -447,9 +590,9 @@ app.get('/api/admin/surveys', async (req, res) => {
 
 // === COMPANY APPLICANT SURVEYS ===
 app.post('/api/company-applicant-surveys', async (req, res) => {
-    const { companyId, applicantEmail, applicantName, stageNumber, responses } = req.body;
+    const { companyId, applicantEmail, applicantName, age, gender, studyField, stageNumber, responses } = req.body;
 
-    if (!companyId || !applicantEmail || !applicantName || stageNumber === undefined || !responses || !Array.isArray(responses)) {
+    if (!companyId || !applicantEmail || !applicantName || !age || !gender || !studyField || stageNumber === undefined || !responses || !Array.isArray(responses)) {
         return res.status(400).json({ error: 'Missing or invalid applicant survey data.' });
     }
 
@@ -460,10 +603,10 @@ app.post('/api/company-applicant-surveys', async (req, res) => {
         const submittedAt = new Date();
 
         const applicantSurveyQuery = `
-            INSERT INTO CompanyApplicantSurveys (unique_survey_id, company_id, applicant_email, applicant_name, stage_number, submitted_at)
-            VALUES ($1, $2, $3, $4, $5, $6) RETURNING unique_survey_id;
+            INSERT INTO CompanyApplicantSurveys (unique_survey_id, company_id, applicant_email, applicant_name, stage_number, submitted_at, age, gender, study_field)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING unique_survey_id;
         `;
-        await client.query(applicantSurveyQuery, [uniqueSurveyId, companyId, applicantEmail, applicantName, stageNumber, submittedAt]);
+        await client.query(applicantSurveyQuery, [uniqueSurveyId, companyId, applicantEmail, applicantName, stageNumber, submittedAt, age, gender, studyField]);
 
         for (const response of responses) {
             if (!response.questionId || typeof response.answer !== 'number') {
@@ -476,11 +619,11 @@ app.post('/api/company-applicant-surveys', async (req, res) => {
             await client.query(responseQuery, [uniqueSurveyId, response.questionId, response.answer]);
         }
         
-        const fullSurveyDataForHistorical = { companyId, applicantEmail, applicantName, stageNumber, responses, submittedAt };
+        const fullSurveyDataForHistorical = { companyId, applicantEmail, applicantName, stageNumber, responses, submittedAt, age, gender, studyField };
         await addApplicantSurveyToHistorical(client, fullSurveyDataForHistorical, uniqueSurveyId);
 
         await client.query('COMMIT');
-        const submittedSurvey = { uniqueSurveyId, companyId, applicantEmail, applicantName, stageNumber, responses, submittedAt: submittedAt.toISOString() };
+        const submittedSurvey = { uniqueSurveyId, companyId, applicantEmail, applicantName, stageNumber, responses, submittedAt: submittedAt.toISOString(), age, gender, studyField };
         res.status(201).json({ message: 'Applicant survey submitted successfully!', survey: submittedSurvey });
 
     } catch (error) {
@@ -514,6 +657,9 @@ app.get('/api/companies/:companyId/applicant-surveys', async (req, res) => {
                     applicantEmail: row.applicant_email,
                     applicantName: row.applicant_name,
                     stageNumber: row.stage_number,
+                    age: row.age,
+                    gender: row.gender,
+                    studyField: row.study_field,
                     submittedAt: row.submitted_at.toISOString(),
                     responses: []
                 });
